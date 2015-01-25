@@ -7,14 +7,17 @@
 package syscall_test
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -56,6 +59,16 @@ func _() {
 		_ = syscall.F_SETLK
 		_ = syscall.F_SETLKW
 	)
+}
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GO_DEATHSIG_PARENT") == "1" {
+		deathSignalParent()
+	} else if os.Getenv("GO_DEATHSIG_CHILD") == "1" {
+		deathSignalChild()
+	}
+
+	os.Exit(m.Run())
 }
 
 // TestFcntlFlock tests whether the file locking structure matches
@@ -311,4 +324,115 @@ func TestSeekFailure(t *testing.T) {
 	if str == "" {
 		t.Fatalf("Seek(-1, 0, 0) return error with empty message")
 	}
+}
+
+func TestLinuxDeathSignal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping linux only test")
+	}
+	if os.Getuid() != 0 {
+		t.Skip("skipping root only test")
+	}
+
+	// XXX The /tmp/go-buildNNNN directory that gets created for these tests
+	// has the access mode of 0700 which means that when we drop our privileges the
+	// new user will not be able to re-exec our test binary
+	baseSplit := strings.Split(os.Args[0], "/")[1:] // ignore leading slash
+	if len(baseSplit) < 2 {
+		t.Fatal("could not determine test directory")
+	}
+	testBaseDir := fmt.Sprintf("/%s/%s", baseSplit[0], baseSplit[1])
+
+	err := os.Chmod(testBaseDir, 0755)
+	if err != nil {
+		t.Fatalf("could not chmod test directory %q: %v", testBaseDir, err)
+	}
+	defer func() {
+		err = os.Chmod(testBaseDir, 0700)
+		if err != nil {
+			t.Fatalf("Could not re-chmod test directory %q: %v", testBaseDir, err)
+		}
+	}()
+
+	chldStdinR, chldStdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal("failed to create new stdin pipe: %v", err)
+	}
+	chldStdoutR, chldStdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal("failed to create new stdout pipe: %v", err)
+	}
+	defer chldStdinW.Close()
+	defer chldStdoutR.Close()
+
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = []string{"GO_DEATHSIG_PARENT=1"}
+	cmd.Stdin = chldStdinR
+	cmd.Stdout = chldStdoutW
+	cmd.Stderr = os.Stderr
+
+	err = cmd.Start()
+	if err != nil {
+		t.Fatalf("failed to start first child process: %v", err)
+	}
+	chldStdinR.Close()
+	chldStdoutW.Close()
+
+	chldPipe := bufio.NewReader(chldStdoutR)
+
+	if got, err := chldPipe.ReadString('\n'); got == "start\n" {
+		syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
+		cmd.Wait()
+
+		// Give grandchild a chance to deal with signal
+		time.Sleep(200 * time.Millisecond)
+
+		chldStdinW.Close()
+		want := "ok\n"
+		if got, err = chldPipe.ReadString('\n'); got != want {
+			t.Fatalf("expected %q, received %q, %v", want, got, err)
+		}
+	} else {
+		t.Fatalf("did not receive start from child, received %q, %v", got, err)
+	}
+}
+
+func deathSignalParent() {
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = []string{"GO_DEATHSIG_CHILD=1"}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	attrs := syscall.SysProcAttr{
+		Pdeathsig: syscall.SIGUSR1,
+		// UID/GID 99 is the user/group "nobody" on RHEL/Fedora and is
+		// unused on Ubuntu
+		Credential: &syscall.Credential{Uid: 99, Gid: 99},
+	}
+	cmd.SysProcAttr = &attrs
+
+	err := cmd.Start()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "death signal parent error: %v\n")
+		os.Exit(1)
+	}
+	cmd.Wait()
+	os.Exit(0)
+}
+
+func deathSignalChild() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGUSR1)
+	go func() {
+		<-c
+		fmt.Println("ok")
+		os.Exit(0)
+	}()
+	fmt.Println("start")
+
+	buf := make([]byte, 32)
+	os.Stdin.Read(buf)
+
+	// We expected to be signaled before stdin closed
+	fmt.Println("not ok")
+	os.Exit(1)
 }
